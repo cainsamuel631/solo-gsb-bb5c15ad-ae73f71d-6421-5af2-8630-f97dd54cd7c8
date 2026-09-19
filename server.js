@@ -2,7 +2,7 @@
 
 const path = require('path');
 const express = require('express');
-const { solve, MAX_SCENES, normalizeProps } = require('./solver');
+const { solve, replan, MAX_SCENES, normalizeProps } = require('./solver');
 const store = require('./store');
 
 const app = express();
@@ -106,12 +106,71 @@ function validatePayload(body) {
   };
 }
 
+/**
+ * 校验并规范化演出中重排状态（随方案一起持久化的部分）。
+ * 结构：{ completedIds: string[], currentProps: string[],
+ *         originalOrder: string[], currentOrder: string[], result?: object }
+ * 非法字段直接丢弃；返回 null 表示无重排状态。
+ */
+function normalizeReplan(body) {
+  const raw = body && body.replan;
+  if (!raw || typeof raw !== 'object') return null;
+  if (!Array.isArray(raw.completedIds) || !Array.isArray(raw.currentOrder)) return null;
+
+  const out = {
+    completedIds: raw.completedIds.map(x => String(x)),
+    currentProps: normalizeProps(raw.currentProps),
+    originalOrder: Array.isArray(raw.originalOrder) ? raw.originalOrder.map(x => String(x)) : [],
+    currentOrder: raw.currentOrder.map(x => String(x)),
+  };
+  if (raw.result && typeof raw.result === 'object') out.result = raw.result;
+  return out;
+}
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/solve', (req, res) => {
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
   res.json(solve(scenes, constraints, { mode, timeLimit }));
+});
+
+/** 演出中重排：确认已完成前缀 + 当前舞台实际道具，只重排剩余场景 */
+app.post('/api/replan', (req, res) => {
+  const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
+  if (errors.length) return res.status(400).json({ ok: false, errors });
+
+  const b = req.body || {};
+  const replanErrors = [];
+  const originalOrder = Array.isArray(b.originalOrder) ? b.originalOrder.map(x => String(x)) : null;
+  const completedIds = Array.isArray(b.completedIds) ? b.completedIds.map(x => String(x)) : null;
+  if (!originalOrder) replanErrors.push('缺少原计划顺序 originalOrder');
+  if (!completedIds) replanErrors.push('缺少已完成场景 completedIds');
+  if (replanErrors.length) return res.status(400).json({ ok: false, errors: replanErrors });
+
+  const idSet = new Set(scenes.map(s => s.id));
+  if (originalOrder.some(id => !idSet.has(id))) {
+    return res.status(400).json({ ok: false, errors: ['原计划顺序包含不存在的场景'] });
+  }
+  if (new Set(originalOrder).size !== originalOrder.length) {
+    return res.status(400).json({ ok: false, errors: ['原计划顺序存在重复场景'] });
+  }
+  if (completedIds.some(id => !idSet.has(id))) {
+    return res.status(400).json({ ok: false, errors: ['已完成场景包含不存在的场景'] });
+  }
+  if (new Set(completedIds).size !== completedIds.length) {
+    return res.status(400).json({ ok: false, errors: ['已完成场景存在重复'] });
+  }
+
+  const result = replan(scenes, constraints, {
+    mode,
+    timeLimit,
+    originalOrder,
+    completedIds,
+    currentProps: b.currentProps,
+  });
+  if (result.errors) return res.status(400).json({ ok: false, errors: result.errors });
+  res.json(result);
 });
 
 app.get('/api/plans', (req, res) => {
@@ -123,7 +182,8 @@ app.post('/api/plans', (req, res) => {
   if (!name) return res.status(400).json({ ok: false, errors: ['方案名称不能为空'] });
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
-  const plan = store.create({ name, mode, timeLimit, scenes, constraints });
+  const replanState = normalizeReplan(req.body);
+  const plan = store.create({ name, mode, timeLimit, scenes, constraints, replan: replanState });
   res.status(201).json({ ok: true, plan });
 });
 
@@ -138,7 +198,8 @@ app.put('/api/plans/:id', (req, res) => {
   if (!name) return res.status(400).json({ ok: false, errors: ['方案名称不能为空'] });
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
-  const plan = store.update(req.params.id, { name, mode, timeLimit, scenes, constraints });
+  const replanState = normalizeReplan(req.body);
+  const plan = store.update(req.params.id, { name, mode, timeLimit, scenes, constraints, replan: replanState });
   if (!plan) return res.status(404).json({ ok: false, errors: ['方案不存在'] });
   res.json({ ok: true, plan });
 });

@@ -114,6 +114,25 @@
       <h2>4. 计算结果</h2>
       <div id="result"></div>
     </section>
+
+    <section class="card" id="replan-card" hidden>
+      <h2>5. 演出中重排</h2>
+      <p class="hint">
+        演出进行中，确认已完成的连续前缀并录入当前舞台实际道具，系统只重排剩余场景。
+        已完成顺序不可改变；固定序位仍按整场绝对位次计算；时长受限模式会扣除已用时长。
+      </p>
+      <div class="replan-controls">
+        <label>已完成前
+          <input type="number" id="replan-k" min="0" step="1" value="0"> 场
+        </label>
+        <button id="btn-replan" class="btn btn-primary">🔀 只重排剩余场景</button>
+      </div>
+      <label class="replan-props-label">当前舞台实际道具（逗号分隔，可与计划不同）：
+        <input type="text" id="replan-props" placeholder="如：长桌, 椅子">
+      </label>
+      <div id="replan-prefix-preview" class="replan-prefix-preview"></div>
+      <div id="replan-result"></div>
+    </section>
   </main>
 
   <script src="app.js"></script>

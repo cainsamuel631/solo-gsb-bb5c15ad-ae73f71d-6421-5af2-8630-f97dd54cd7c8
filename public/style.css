@@ -247,3 +247,60 @@ input[type="number"] { width: 70px; }
 .conflict-box li { margin-top: 4px; }
 
 .error-list { color: #ffb3b0; margin: 8px 0 0; padding-left: 20px; }
+
+/* ================= 演出中重排 ================= */
+.replan-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+#replan-k { width: 80px; }
+.replan-props-label {
+  display: block;
+  margin: 10px 0;
+  font-size: 14px;
+}
+#replan-props { width: 100%; margin-top: 6px; }
+
+.replan-prefix-preview {
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 8px 0 14px;
+}
+.order-chip-done {
+  background: #3a3f4a;
+  color: #b8c0cc;
+  border: 1px solid #525c6b;
+}
+.order-chip-todo { background: var(--accent-2); }
+
+.replan-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 12px 0;
+}
+@media (max-width: 760px) {
+  .replan-cols { grid-template-columns: 1fr; }
+}
+.replan-col {
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+.col-plan { opacity: 0.92; }
+.col-new { border-color: var(--accent); }
+
+.cost-save strong { color: var(--ok) !important; }
+.cost-add strong { color: #ff9d9a !important; }
+.cost-same strong { color: var(--muted) !important; }
+
+.replan-full { margin-top: 14px; }
+
+#replan-result .conflict-box, #replan-result .scene-pick { margin-top: 12px; }

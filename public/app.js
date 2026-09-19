@@ -11,6 +11,7 @@ const state = {
   timeLimit: 120,
   scenes: [], // classic: { id, name, props }；timed 额外带 { duration, required, value }
   constraints: { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] },
+  replan: null, // 演出中重排状态：{ originalOrder, completedIds, currentProps, result }
 };
 
 const isTimed = () => state.mode === 'timed';
@@ -169,6 +170,8 @@ function applyMode(mode) {
     });
   }
   $('#result-card').hidden = true;
+  $('#replan-card').hidden = true;
+  state.replan = null;
   renderAll();
 }
 
@@ -273,6 +276,8 @@ function showStatus(msg, isError) {
 
 async function doSolve() {
   $('#result-card').hidden = true;
+  $('#replan-card').hidden = true;
+  state.replan = null;
   const data = await api('/api/solve', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -291,6 +296,7 @@ async function doSolve() {
     return;
   }
   box.appendChild(data.mode === 'timed' ? timedResultBlock(data) : resultBlock(data));
+  openReplanPanel(data.order, data);
   $('#result-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
@@ -330,7 +336,7 @@ function conflictBlock(conflict, isOvertime) {
   return div;
 }
 
-function flowBlock(order) {
+function flowBlock(order, offset = 0) {
   const flow = document.createElement('div');
   flow.className = 'order-flow';
   if (!order.length) {
@@ -350,7 +356,7 @@ function flowBlock(order) {
     const s = sceneById(id);
     const chip = document.createElement('span');
     chip.className = 'order-chip' + (s && s.required ? ' order-chip-req' : '');
-    chip.textContent = `${i + 1}. ${sceneName(id)}${s && s.required ? ' ★必演' : ''}`;
+    chip.textContent = `${i + 1 + offset}. ${sceneName(id)}${s && s.required ? ' ★必演' : ''}`;
     flow.appendChild(chip);
   });
   return flow;
@@ -460,6 +466,267 @@ function escapeHtml(s) {
   }[ch]));
 }
 
+/* ================= 演出中重排 ================= */
+function currentPropsFromOrder(order, k) {
+  if (k <= 0) return [];
+  const s = sceneById(order[k - 1]);
+  return s ? s.props.slice() : [];
+}
+
+/** 打开重排卡片。order 为当前可依据的完整顺序；existing 为已保存的重排状态（载入方案时）。 */
+function openReplanPanel(order, existing) {
+  const card = $('#replan-card');
+  if (!order || !order.length) { card.hidden = true; return; }
+  card.hidden = false;
+  if (existing) {
+    state.replan = {
+      originalOrder: existing.originalOrder.slice(),
+      completedIds: existing.completedIds.slice(),
+      currentProps: (existing.currentProps || []).slice(),
+      result: existing.result || null,
+    };
+  } else {
+    state.replan = {
+      originalOrder: order.slice(),
+      completedIds: [],
+      currentProps: [],
+      result: null,
+    };
+  }
+  const kInput = $('#replan-k');
+  kInput.max = existing && state.replan.result ? state.replan.result.order.length : order.length;
+  if (existing) {
+    kInput.value = state.replan.completedIds.length;
+  } else {
+    const k0 = Math.min(1, order.length);
+    kInput.value = k0;
+    state.replan.completedIds = order.slice(0, k0);
+    state.replan.currentProps = currentPropsFromOrder(order, k0);
+  }
+  syncReplanK(false);
+  renderReplanResult();
+}
+
+/** 根据 k 输入同步 completedIds 与道具输入框 */
+function syncReplanK(resetProps) {
+  if (!state.replan) return;
+  const order = state.replan.result ? state.replan.result.order : state.replan.originalOrder;
+  const kInput = $('#replan-k');
+  let k = Math.floor(Number(kInput.value) || 0);
+  k = Math.max(0, Math.min(k, order.length));
+  kInput.value = k;
+  state.replan.completedIds = order.slice(0, k);
+  if (resetProps) {
+    state.replan.currentProps = currentPropsFromOrder(order, k);
+  }
+  $('#replan-props').value = state.replan.currentProps.join(', ');
+  renderPrefixPreview(order, k);
+}
+
+function renderPrefixPreview(order, k) {
+  const wrap = $('#replan-prefix-preview');
+  wrap.innerHTML = '';
+  if (!order.length) return;
+  const mkChip = (id, i, cls) => {
+    const chip = document.createElement('span');
+    chip.className = 'order-chip ' + cls;
+    chip.textContent = `${i + 1}. ${sceneName(id)}`;
+    return chip;
+  };
+  const arrow = () => {
+    const a = document.createElement('span');
+    a.className = 'order-arrow';
+    a.textContent = '→';
+    return a;
+  };
+  order.forEach((id, i) => {
+    if (i > 0) wrap.appendChild(arrow());
+    wrap.appendChild(mkChip(id, i, i < k ? 'order-chip-done' : 'order-chip-todo'));
+  });
+  const legend = document.createElement('p');
+  legend.className = 'hint';
+  legend.textContent = k === 0
+    ? '尚未确认已完成场次，将按空舞台重排全场。'
+    : `已完成 ${k} 场（灰色锁定，顺序不可改变），剩余 ${order.length - k} 场参与重排。`;
+  wrap.appendChild(legend);
+}
+
+async function doReplan() {
+  if (!state.replan) { showStatus('请先计算最优顺序', true); return; }
+  syncReplanK(false);
+  state.replan.currentProps = $('#replan-props').value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+
+  const body = {
+    ...payload(),
+    originalOrder: state.replan.originalOrder,
+    completedIds: state.replan.completedIds,
+    currentProps: state.replan.currentProps,
+  };
+  const data = await api('/api/replan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const box = $('#replan-result');
+  box.innerHTML = '';
+  if (data.errors) {
+    box.appendChild(errorBlock(data.errors));
+    return;
+  }
+  if (!data.ok) {
+    const isOvertime = data.reason === 'prefix-overtime' || data.reason === 'required-overtime';
+    box.appendChild(conflictBlock(data.conflict, isOvertime));
+    return;
+  }
+  state.replan.result = data;
+  // 重排后继续以新完整顺序为基准，已完成前缀保持不变
+  state.replan.originalOrder = data.order.slice();
+  renderReplanResult();
+  const kInput = $('#replan-k');
+  kInput.max = data.order.length;
+  kInput.value = data.prefixIds.length;
+  syncReplanK(false); // 不重置道具：保留用户录入的当前实际道具
+  showStatus('已按当前舞台实际情况重排剩余场景，保存后可继续重排');
+}
+
+function renderReplanResult() {
+  const box = $('#replan-result');
+  box.innerHTML = '';
+  const r = state.replan && state.replan.result;
+  if (!r) return;
+  box.appendChild(replanSummaryBlock(r));
+
+  const cols = document.createElement('div');
+  cols.className = 'replan-cols';
+  cols.appendChild(replanColumn('原计划后缀', r.plannedSuffixIds, r.plannedSteps, r.prefixIds.length, 'col-plan'));
+  cols.appendChild(replanColumn('重排后新后缀', r.suffixIds, r.newSteps, r.prefixIds.length, 'col-new'));
+  box.appendChild(cols);
+
+  if (r.mode === 'timed') {
+    box.appendChild(replanAbandonedBlock(r));
+  }
+
+  const full = document.createElement('div');
+  full.className = 'replan-full';
+  const h = document.createElement('h3');
+  h.textContent = '重排后完整节目单（已完成前缀锁定）';
+  full.appendChild(h);
+  const flow = document.createElement('div');
+  flow.className = 'order-flow';
+  const appendChip = (id, i, cls) => {
+    if (flow.children.length) {
+      const a = document.createElement('span');
+      a.className = 'order-arrow';
+      a.textContent = '→';
+      flow.appendChild(a);
+    }
+    const chip = document.createElement('span');
+    chip.className = 'order-chip ' + cls;
+    chip.textContent = `${i + 1}. ${sceneName(id)}`;
+    flow.appendChild(chip);
+  };
+  r.prefixIds.forEach((id, i) => appendChip(id, i, 'order-chip-done'));
+  r.suffixIds.forEach((id, i) => appendChip(id, r.prefixIds.length + i, 'order-chip-todo'));
+  full.appendChild(flow);
+  box.appendChild(full);
+}
+
+function replanSummaryBlock(r) {
+  const div = document.createElement('div');
+  div.className = 'timed-summary';
+  const deltaCls = r.costDelta < 0 ? 'cost-save' : (r.costDelta > 0 ? 'cost-add' : 'cost-same');
+  const deltaText = r.costDelta === 0
+    ? '增减 0 次'
+    : (r.costDelta < 0 ? `减少 ${-r.costDelta} 次` : `增加 ${r.costDelta} 次`);
+  let html =
+    `<span>原计划后缀换景：<strong>${r.plannedSuffixCost}</strong> 次</span>` +
+    `<span>新后缀换景：<strong>${r.newSuffixCost}</strong> 次</span>` +
+    `<span class="${deltaCls}">相对原计划：<strong>${deltaText}</strong></span>`;
+  if (r.mode === 'timed') {
+    html +=
+      `<span>前缀已用：<strong>${r.prefixDuration}</strong> 分 / 价值 <strong>${r.prefixValue}</strong></span>` +
+      `<span>后缀时长：<strong>${r.suffixDuration}</strong> 分 / 价值 <strong>${r.suffixValue}</strong></span>` +
+      `<span>整场已用：<strong>${r.usedDuration}</strong> / ${r.timeLimit} 分（剩 ${r.remainingDuration} 分）</span>`;
+  }
+  div.innerHTML = html;
+  return div;
+}
+
+function replanColumn(title, ids, steps, offset, cls) {
+  const col = document.createElement('div');
+  col.className = 'replan-col ' + cls;
+  const h = document.createElement('h3');
+  h.textContent = title + (ids.length ? `（${ids.length} 场）` : '（空）');
+  col.appendChild(h);
+  col.appendChild(flowBlock(ids, offset));
+  if (!ids.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '无剩余场景';
+    col.appendChild(p);
+    return col;
+  }
+  const ul = document.createElement('ul');
+  ul.className = 'step-list';
+  steps.forEach((step) => {
+    const li = document.createElement('li');
+    const t = document.createElement('div');
+    t.className = 'step-title';
+    if (step.type === 'setup') {
+      t.textContent = `开场布置 →「${sceneName(step.scene)}」`;
+    } else if (step.type === 'rejoin' && step.fromCurrent) {
+      t.textContent = `从当前实际道具换入 →「${sceneName(step.scene)}」`;
+    } else if (step.type === 'rejoin') {
+      t.textContent = `接演：「${sceneName(step.from)}」→「${sceneName(step.to)}」`;
+    } else {
+      t.textContent = `「${sceneName(step.from)}」→「${sceneName(step.to)}」`;
+    }
+    li.appendChild(t);
+    const detail = document.createElement('div');
+    const parts = [];
+    if (step.removed.length) parts.push(`<span class="prop-del">撤下：${escapeHtml(step.removed.join('、'))}</span>`);
+    if (step.added.length) parts.push(`<span class="prop-add">上台：${escapeHtml(step.added.join('、'))}</span>`);
+    if (!parts.length) parts.push('<span class="prop-none">道具无变化</span>');
+    detail.innerHTML = parts.join('　｜　') + `　<span class="step-count">（${step.count} 次）</span>`;
+    li.appendChild(detail);
+    ul.appendChild(li);
+  });
+  col.appendChild(ul);
+  return col;
+}
+
+function replanAbandonedBlock(r) {
+  const forced = r.forcedOutIds || [];
+  const abandoned = r.abandonedIds || [];
+  if (!forced.length && !abandoned.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'scene-pick pick-out';
+    wrap.innerHTML = '<h3>舍弃场景</h3><p class="hint">无</p>';
+    return wrap;
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'scene-pick pick-out';
+  const h = document.createElement('h3');
+  h.textContent = '舍弃场景';
+  wrap.appendChild(h);
+  const ul = document.createElement('ul');
+  ul.className = 'pick-list';
+  for (const id of forced) {
+    const li = document.createElement('li');
+    li.innerHTML = `<strong>${escapeHtml(sceneName(id))}</strong><span class="hint">强制舍弃：${escapeHtml(r.forcedOutReasons[id] || '按完成事实无法参演')}</span>`;
+    ul.appendChild(li);
+  }
+  for (const id of abandoned) {
+    const s = sceneById(id);
+    const tags = s ? [`${s.duration} 分钟`, `价值 ${s.value || 0}`] : [];
+    const li = document.createElement('li');
+    li.innerHTML = `<strong>${escapeHtml(sceneName(id))}</strong><span class="hint">剩余选择中舍弃（${escapeHtml(tags.join(' · '))}）</span>`;
+    ul.appendChild(li);
+  }
+  wrap.appendChild(ul);
+  return wrap;
+}
+
 /* ================= 方案保存 / 载入 ================= */
 async function refreshPlans() {
   const data = await api('/api/plans');
@@ -468,7 +735,7 @@ async function refreshPlans() {
   for (const p of data.plans) {
     const opt = document.createElement('option');
     opt.value = p.id;
-    opt.textContent = `${p.name}（${p.sceneCount} 个场景，更新于 ${new Date(p.updatedAt).toLocaleString()}）`;
+    opt.textContent = `${p.inProgress ? '🎬 ' : ''}${p.name}（${p.sceneCount} 个场景${p.inProgress ? '，演出中' : ''}，更新于 ${new Date(p.updatedAt).toLocaleString()}）`;
     sel.appendChild(opt);
   }
   if (state.planId) sel.value = state.planId;
@@ -477,14 +744,25 @@ async function refreshPlans() {
 async function savePlan() {
   const name = $('#plan-name').value.trim();
   if (!name) { showStatus('请先填写方案名称', true); return; }
-  const body = JSON.stringify({ name, ...payload() });
+  const base = { name, ...payload() };
+  // 仅在已确认过完成前缀或已得到重排结果时持久化重排状态
+  if (state.replan && (state.replan.completedIds.length > 0 || state.replan.result)) {
+    base.replan = {
+      originalOrder: state.replan.originalOrder,
+      completedIds: state.replan.completedIds,
+      currentProps: state.replan.currentProps,
+      currentOrder: state.replan.result ? state.replan.result.order : state.replan.originalOrder,
+      result: state.replan.result,
+    };
+  }
+  const body = JSON.stringify(base);
   const headers = { 'Content-Type': 'application/json' };
   const data = state.planId
     ? await api(`/api/plans/${state.planId}`, { method: 'PUT', headers, body })
     : await api('/api/plans', { method: 'POST', headers, body });
   if (data.errors) { showStatus(data.errors.join('；'), true); return; }
   state.planId = data.plan.id;
-  showStatus(`方案「${name}」已保存`);
+  showStatus(`方案「${name}」已保存${base.replan ? '（含演出中重排进度，载入后可继续重排）' : ''}`);
   await refreshPlans();
 }
 
@@ -518,6 +796,18 @@ function hydrateFromPlan(p) {
   };
   $('#time-limit').value = state.timeLimit;
   applyMode(state.mode);
+  // 恢复演出中重排进度
+  state.replan = null;
+  $('#replan-card').hidden = true;
+  if (p.replan && Array.isArray(p.replan.completedIds) && Array.isArray(p.replan.currentOrder)) {
+    const order = p.replan.currentOrder;
+    openReplanPanel(order, {
+      originalOrder: p.replan.originalOrder && p.replan.originalOrder.length ? p.replan.originalOrder : order,
+      completedIds: p.replan.completedIds,
+      currentProps: p.replan.currentProps || [],
+      result: p.replan.result || null,
+    });
+  }
 }
 
 async function deletePlan() {
@@ -534,10 +824,12 @@ function newPlan() {
   state.planId = null;
   state.scenes = [];
   state.constraints = { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] };
+  state.replan = null;
   $('#plan-name').value = '';
   $('#plan-select').value = '';
   applyMode('classic');
   $('#result-card').hidden = true;
+  $('#replan-card').hidden = true;
   showStatus('已新建空白方案');
 }
 
@@ -632,6 +924,15 @@ $('#btn-add-noadj').addEventListener('click', () => {
   if (!a || !b) return;
   state.constraints.forbiddenAdjacencies.push({ a, b });
   renderConstraintLists();
+});
+
+/* 演出中重排 */
+$('#btn-replan').addEventListener('click', doReplan);
+$('#replan-k').addEventListener('input', () => syncReplanK(true));
+$('#replan-props').addEventListener('input', () => {
+  if (state.replan) {
+    state.replan.currentProps = $('#replan-props').value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+  }
 });
 
 /* ================= 初始化 ================= */
