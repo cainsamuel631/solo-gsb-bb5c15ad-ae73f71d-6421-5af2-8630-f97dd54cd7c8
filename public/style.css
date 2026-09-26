@@ -247,3 +247,100 @@ input[type="number"] { width: 70px; }
 .conflict-box li { margin-top: 4px; }
 
 .error-list { color: #ffb3b0; margin: 8px 0 0; padding-left: 20px; }
+
+/* ================= 演出中重排 ================= */
+.order-chip-done {
+  background: #3a5a45;
+  border: 1px solid var(--ok);
+  opacity: 0.92;
+}
+.order-flow-ref .order-chip {
+  background: var(--card-2);
+  border: 1px dashed var(--muted);
+  color: var(--muted);
+  font-weight: normal;
+  font-size: 13px;
+  padding: 5px 12px;
+}
+.order-flow-ref .order-arrow { opacity: 0.5; }
+
+.replan-compare {
+  border: 1px solid var(--accent-2);
+  background: rgba(124, 92, 191, 0.08);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+.replan-compare h3 { margin: 0 0 10px; }
+.replan-cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}
+.replan-col {
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.replan-col-old { opacity: 0.9; }
+.replan-col-new { border-color: var(--ok); }
+.replan-col-title {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 8px;
+  font-weight: bold;
+}
+.replan-col-new .replan-col-title { color: var(--ok); }
+
+.replan-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+  font-size: 14px;
+}
+.replan-stats strong { color: var(--accent); }
+.delta-up { color: #ff9d9a; font-weight: bold; }
+.delta-down { color: var(--ok); font-weight: bold; }
+.delta-flat { color: var(--muted); }
+
+.replan-changes { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.replan-change-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 13.5px; }
+.replan-change-label { color: var(--muted); min-width: 72px; }
+.change-chip {
+  border-radius: 14px;
+  padding: 2px 12px;
+  font-size: 13px;
+  border: 1px solid;
+}
+.change-drop { color: #ffb3b0; border-color: var(--danger); background: rgba(217,83,79,0.12); }
+.change-add { color: #9fe0bb; border-color: var(--ok); background: rgba(76,175,125,0.12); }
+
+.replan-panel {
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-top: 18px;
+  background: rgba(232, 182, 76, 0.05);
+}
+.replan-panel h3 { margin: 0 0 6px; }
+.replan-krow { display: flex; align-items: center; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.replan-prefix-preview { margin: 8px 0 12px; padding: 8px 10px; background: var(--card-2); border-radius: 6px; }
+.replan-props-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; font-size: 14px; }
+.replan-props-input { flex: 1 1 260px; width: auto; }
+.replan-msg { margin-top: 10px; }
+.replan-msg.replan-error .conflict-box { margin-top: 8px; }
+
+.phase-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: bold;
+  border-radius: 4px;
+  padding: 1px 7px;
+  vertical-align: middle;
+}
+.phase-done { background: #3a5a45; color: #bfe8cf; border: 1px solid var(--ok); }
+.phase-suffix { background: #4a3a6b; color: #d9c9f5; border: 1px solid var(--accent-2); }
+.step-done { opacity: 0.62; }
+.step-done .step-title { text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.35); }

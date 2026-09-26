@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('assert');
-const { solve } = require('../solver');
+const { solve, replan } = require('../solver');
 
 const S = (id, props) => ({ id, name: id, props });
 // 时长受限场景：T(id, props, duration, required, value)
@@ -395,6 +395,270 @@ const timed = (timeLimit) => ({ mode: 'timed', timeLimit });
   const r = solve(scenes, C(), timed(20));
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.totalValue, 7);
+}
+
+/* ================= 演出中重排（replan）================= */
+
+const R = (opts) => ({ replan: opts });
+
+/* 27. 经典重排：前缀固定，剩余重排；首个剩余代价按实际道具；账目一致 */
+{
+  const scenes = [
+    S('A', ['x']),
+    S('B', ['x']),
+    S('C', ['y']),
+    S('D', ['y']),
+  ];
+  const r = replan(scenes, C(), R({ prefixIds: ['A'], stageProps: ['z'], originalOrder: ['B', 'A', 'D', 'C'] }));
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.replanned, true);
+  assert.deepStrictEqual(r.prefixIds, ['A']);
+  assert.strictEqual(r.order[0], 'A'); // 前缀不可改变
+  // 舞台实际 {z}：剩余 B{x}, C{y}, D{y} 首场景代价都是 2；后缀内部 C、D 相同
+  assert.deepStrictEqual(r.suffixIds.slice().sort(), ['B', 'C', 'D']);
+  // 第一个后缀步骤：从实际道具 {z} 切入
+  const firstSuffixStep = r.steps.find(s => s.fromStage);
+  assert.ok(firstSuffixStep);
+  assert.deepStrictEqual(firstSuffixStep.removed.sort(), ['z']);
+  assert.strictEqual(r.prefixCost, 1); // 开场 A{x} = 1
+  assert.strictEqual(r.totalCost, r.prefixCost + r.suffixCost);
+  assert.strictEqual(r.steps.reduce((a, s) => a + s.count, 0), r.totalCost);
+  // 与原计划的整场代价对比：B{x}=1, B→A 0, A→D 2, D→C 0 → 3
+  assert.strictEqual(r.originalTotalCost, 3);
+  assert.strictEqual(r.costDelta, r.totalCost - r.originalTotalCost);
+}
+
+/* 28. 跨前缀依赖按完成事实校验：
+   - before 已完成、after 在剩余：合法；
+   - after 已完成、before 在剩余：具体冲突。 */
+{
+  const scenes = [S('A', []), S('B', []), S('C', [])];
+  const ok = replan(scenes, C({ dependencies: [{ before: 'A', after: 'B' }] }),
+    R({ prefixIds: ['A'], stageProps: [] }));
+  assert.strictEqual(ok.ok, true);
+  assert.ok(ok.order.indexOf('A') < ok.order.indexOf('B'));
+
+  const bad = replan(scenes, C({ dependencies: [{ before: 'C', after: 'A' }] }),
+    R({ prefixIds: ['A'], stageProps: [] }));
+  assert.strictEqual(bad.ok, false);
+  assert.strictEqual(bad.conflict.type, 'prefix-conflict');
+  assert.strictEqual(bad.conflict.conflicts[0].type, 'dependency-cross');
+}
+
+/* 29. 前缀内部顺序违反依赖 / 禁止相邻：指出具体冲突 */
+{
+  const scenes = [S('A', []), S('B', []), S('C', [])];
+  const dep = replan(scenes, C({ dependencies: [{ before: 'B', after: 'A' }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(dep.ok, false);
+  assert.strictEqual(dep.conflict.conflicts[0].type, 'dependency-order');
+
+  const adj = replan(scenes, C({ forbiddenAdjacencies: [{ a: 'A', b: 'B' }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(adj.ok, false);
+  assert.strictEqual(adj.conflict.conflicts[0].type, 'forbidden-adjacency-prefix');
+}
+
+/* 30. 固定序位按整场绝对位次：前缀场景错位 / 剩余场景固定在前缀位次 */
+{
+  const scenes = [S('A', []), S('B', []), S('C', [])];
+  const wrong = replan(scenes, C({ fixedPositions: [{ sceneId: 'B', position: 3 }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(wrong.ok, false);
+  assert.strictEqual(wrong.conflict.conflicts[0].type, 'fixed-position-prefix');
+
+  const occupied = replan(scenes, C({ fixedPositions: [{ sceneId: 'C', position: 2 }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(occupied.ok, false);
+  assert.strictEqual(occupied.conflict.conflicts[0].type, 'fixed-position-occupied');
+
+  // B 固定第 2 位，前缀 A、B 恰好满足；后缀 C 可以排
+  const good = replan(scenes, C({ fixedPositions: [{ sceneId: 'B', position: 2 }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(good.ok, true);
+  assert.deepStrictEqual(good.order, ['A', 'B', 'C']);
+}
+
+/* 31. 边界禁止相邻：前缀末场景与首个剩余场景不得相邻；无缓冲 → 后缀冲突核心 */
+{
+  const scenes = [S('A', []), S('B', [])];
+  const r = replan(scenes, C({ forbiddenAdjacencies: [{ a: 'A', b: 'B' }] }),
+    R({ prefixIds: ['A'], stageProps: [] }));
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.conflict.type, 'constraint-set');
+  assert.strictEqual(r.conflict.constraints.length, 1);
+
+  // 有缓冲 C 时可行：首个剩余必为 C
+  const scenes3 = [S('A', []), S('B', []), S('C', [])];
+  const ok = replan(scenes3, C({ forbiddenAdjacencies: [{ a: 'A', b: 'B' }] }),
+    R({ prefixIds: ['A'], stageProps: [] }));
+  assert.strictEqual(ok.ok, true);
+  assert.strictEqual(ok.suffixIds[0], 'C');
+}
+
+/* 32. timed 重排：扣除已用时长；前缀可选价值计入；价值优先、换景次优 */
+{
+  const scenes = [
+    T('A', ['x'], 10, true, 0),
+    T('B', ['x'], 10, false, 5),
+    T('C', ['y'], 10, false, 8),
+  ];
+  // 原计划 C,A（价值 8，20 分钟）；演完 C（前缀，价值 8 计入），剩 10 分钟只能再带 A
+  const r = replan(scenes, C(), { mode: 'timed', timeLimit: 20,
+    replan: { prefixIds: ['C'], stageProps: ['y'], originalOrder: ['C', 'A'] } });
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.order, ['C', 'A']);
+  assert.strictEqual(r.totalValue, 8);
+  assert.strictEqual(r.prefixValue, 8);
+  assert.strictEqual(r.suffixValue, 0);
+  assert.strictEqual(r.prefixDuration, 10);
+  assert.strictEqual(r.timeBudget, 10);
+  assert.strictEqual(r.usedDuration, 20);
+  assert.strictEqual(r.remainingDuration, 0);
+  assert.deepStrictEqual(r.excludedIds, ['B']);
+  assert.strictEqual(r.totalCost, r.prefixCost + r.suffixCost);
+}
+
+/* 33. timed 重排：剩余时长内可新增可选场景，价值优先于换景 */
+{
+  const scenes = [
+    T('A', [], 10, true, 0),
+    T('B', [], 10, false, 5),
+    T('C', [], 10, false, 9),
+  ];
+  // 前缀 A 完成（10 分钟），剩余 20 分钟可带 B、C 两个；价值 14 最大
+  const r = replan(scenes, C(), { mode: 'timed', timeLimit: 30,
+    replan: { prefixIds: ['A'], stageProps: [] } });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.order[0], 'A');
+  assert.deepStrictEqual(r.suffixIds.slice().sort(), ['B', 'C']);
+  assert.strictEqual(r.totalValue, 14);
+}
+
+/* 34. timed 重排：舍弃场景按"原计划有、新计划无"列出 */
+{
+  const scenes = [
+    T('A', [], 10, true, 0),
+    T('B', [], 10, false, 5),
+    T('C', [], 10, false, 8),
+  ];
+  // 原计划 A,C（10+10=20 内价值 8 最优）；演完 A 后只剩 5 分钟 → C 也放不下
+  const r = replan(scenes, C(), { mode: 'timed', timeLimit: 15,
+    replan: { prefixIds: ['A'], stageProps: [], originalOrder: ['A', 'C'] } });
+  assert.strictEqual(r.ok, true);
+  assert.deepStrictEqual(r.order, ['A']);
+  assert.deepStrictEqual(r.droppedScenes, ['C']);
+  assert.strictEqual(r.totalValue, 0);
+  assert.strictEqual(r.usedDuration, 10);
+  assert.strictEqual(r.remainingDuration, 5);
+}
+
+/* 35. timed 前缀超时 / 剩余必演超时 */
+{
+  const scenes = [
+    T('A', [], 15, true, 0),
+    T('B', [], 10, true, 0),
+  ];
+  const over = replan(scenes, C(), { mode: 'timed', timeLimit: 20,
+    replan: { prefixIds: ['A'], stageProps: [] } });
+  assert.strictEqual(over.ok, false);
+  assert.strictEqual(over.conflict.type, 'required-overtime');
+  assert.strictEqual(over.conflict.timeBudget, 5);
+
+  const prefixOver = replan(scenes, C(), { mode: 'timed', timeLimit: 20,
+    replan: { prefixIds: ['A', 'B'], stageProps: [] } });
+  assert.strictEqual(prefixOver.ok, false);
+  assert.strictEqual(prefixOver.conflict.type, 'prefix-overtime');
+}
+
+/* 36. timed：可选场景固定到前缀位次不报错（被禁选）；必演则报前缀冲突 */
+{
+  const scenes = [
+    T('A', [], 10, true, 0),
+    T('X', [], 10, false, 9),
+    T('B', [], 10, true, 0),
+  ];
+  const cons = C({ fixedPositions: [{ sceneId: 'X', position: 1 }] });
+  const ok = replan(scenes, cons, { mode: 'timed', timeLimit: 30,
+    replan: { prefixIds: ['A'], stageProps: [] } });
+  assert.strictEqual(ok.ok, true);
+  assert.ok(!ok.order.includes('X'));
+  assert.deepStrictEqual(ok.excludedIds, ['X']);
+
+  const scenes2 = [T('A', [], 10, true, 0), T('R', [], 10, true, 0)];
+  const bad = replan(scenes2, C({ fixedPositions: [{ sceneId: 'R', position: 1 }] }),
+    { mode: 'timed', timeLimit: 30, replan: { prefixIds: ['A'], stageProps: [] } });
+  assert.strictEqual(bad.ok, false);
+  assert.strictEqual(bad.conflict.conflicts[0].type, 'fixed-position-occupied');
+}
+
+/* 37. 空前缀：从当前实际道具开场；全前缀：空后缀直接完成 */
+{
+  const scenes = [S('A', ['x']), S('B', ['y'])];
+  const r = replan(scenes, C(), R({ prefixIds: [], stageProps: ['q', 'x'] }));
+  assert.strictEqual(r.ok, true);
+  // {q,x} 与 A{x} 对称差 1，与 B{y} 对称差 2 → A 首位更优
+  assert.strictEqual(r.order[0], 'A');
+  assert.strictEqual(r.steps[0].fromStage, true);
+  assert.strictEqual(r.steps[0].count, 1); // 撤 q
+
+  const done = replan([S('A', []), S('B', [])], C({ dependencies: [{ before: 'A', after: 'B' }] }),
+    R({ prefixIds: ['A', 'B'], stageProps: [] }));
+  assert.strictEqual(done.ok, true);
+  assert.deepStrictEqual(done.suffixIds, []);
+  assert.strictEqual(done.suffixCost, 0);
+  assert.deepStrictEqual(done.steps.map(s => s.phase), ['done', 'done']);
+}
+
+/* 38. 连续重排：可基于重排结果继续重排，前缀只能延长 */
+{
+  const scenes = [
+    S('A', ['x']),
+    S('B', ['y']),
+    S('C', ['x', 'y']),
+  ];
+  const r1 = replan(scenes, C(), R({ prefixIds: ['A'], stageProps: ['x'], originalOrder: ['C', 'B', 'A'] }));
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(r1.order[0], 'A');
+  // 再演完 r1 的第二个场景，前缀延长为 2
+  const r2 = replan(scenes, C(), R({
+    prefixIds: r1.order.slice(0, 2),
+    stageProps: ['x', 'y'],
+    originalOrder: r1.order,
+  }));
+  assert.strictEqual(r2.ok, true);
+  assert.strictEqual(r2.prefixIds.length, 2);
+  assert.deepStrictEqual(r2.prefixIds, r1.order.slice(0, 2));
+  assert.strictEqual(r2.suffixIds.length, 1);
+  assert.strictEqual(r2.steps.filter(s => s.phase === 'done').length, 2);
+}
+
+/* 39. 非法前缀：引用不存在的场景 / 场景重复 */
+{
+  const scenes = [S('A', [])];
+  const missing = replan(scenes, C(), R({ prefixIds: ['ZZZ'], stageProps: [] }));
+  assert.strictEqual(missing.ok, false);
+  assert.strictEqual(missing.conflict.type, 'invalid-prefix');
+  const dup = replan([S('A', []), S('B', [])], C(), R({ prefixIds: ['A', 'A'], stageProps: [] }));
+  assert.strictEqual(dup.ok, false);
+  assert.strictEqual(dup.conflict.type, 'invalid-prefix');
+}
+
+/* 40. 12 场景重排性能冒烟（应远小于 1 秒） */
+{
+  const scenes = [];
+  for (let i = 0; i < 12; i++) scenes.push(S(`S${i}`, [`p${i}`, `p${i + 1}`]));
+  const t0 = Date.now();
+  const r = replan(scenes, C({
+    dependencies: [{ before: 'S0', after: 'S11' }],
+    fixedPositions: [{ sceneId: 'S5', position: 6 }],
+    forbiddenAdjacencies: [{ a: 'S1', b: 'S2' }],
+  }), R({ prefixIds: ['S0', 'S1'], stageProps: ['p0', 'p1'] }));
+  const elapsed = Date.now() - t0;
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.order.length, 12);
+  assert.deepStrictEqual(r.prefixIds, ['S0', 'S1']);
+  assert.ok(elapsed < 1000, `重排耗时 ${elapsed}ms，超过预期`);
 }
 
 console.log('全部测试通过 ✔');

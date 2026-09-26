@@ -2,7 +2,7 @@
 
 const path = require('path');
 const express = require('express');
-const { solve, MAX_SCENES, normalizeProps } = require('./solver');
+const { solve, replan, MAX_SCENES, normalizeProps } = require('./solver');
 const store = require('./store');
 
 const app = express();
@@ -106,12 +106,91 @@ function validatePayload(body) {
   };
 }
 
+/**
+ * 在校验过的求解载荷基础上，校验"演出中重排"参数。
+ * 返回 { replan } = { prefixIds, stageProps, originalOrder } 或 errors。
+ */
+function validateReplan(body, scenes) {
+  const errors = [];
+  const idSet = new Set(scenes.map(s => s.id));
+
+  const rawPrefix = body && body.replan && body.replan.prefixIds;
+  const prefixIds = [];
+  const seen = new Set();
+  if (rawPrefix !== undefined) {
+    if (!Array.isArray(rawPrefix)) {
+      errors.push('已完成前缀必须是场景 id 数组');
+    } else if (rawPrefix.length > scenes.length) {
+      errors.push('已完成前缀长度不能超过场景总数');
+    } else {
+      for (const id0 of rawPrefix) {
+        const id = String(id0);
+        if (!idSet.has(id)) { errors.push(`已完成前缀引用了不存在的场景：${id}`); continue; }
+        if (seen.has(id)) { errors.push(`已完成前缀中场景重复：${id}`); continue; }
+        seen.add(id);
+        prefixIds.push(id);
+      }
+    }
+  }
+
+  const stageProps = normalizeProps(body && body.replan && body.replan.stageProps);
+  if (stageProps.length > 60) errors.push('当前舞台道具数量不能超过 60 个');
+
+  let originalOrder;
+  const rawOrder = body && body.replan && body.replan.originalOrder;
+  if (rawOrder !== undefined) {
+    if (!Array.isArray(rawOrder)) {
+      errors.push('原计划顺序必须是场景 id 数组');
+      originalOrder = [];
+    } else {
+      originalOrder = rawOrder.map(String).filter(id => idSet.has(id));
+    }
+  } else {
+    originalOrder = [];
+  }
+
+  return { errors, replan: { prefixIds, stageProps, originalOrder } };
+}
+
+/** 校验方案保存载荷里附带的重排状态（可选；字段不合法则忽略该状态，不阻断保存）。 */
+function sanitizeReplanState(raw, idSet) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (!Array.isArray(raw.prefixIds) || raw.prefixIds.length === 0) return null;
+  const seen = new Set();
+  const prefixIds = [];
+  for (const id0 of raw.prefixIds) {
+    const id = String(id0);
+    if (!idSet.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    prefixIds.push(id);
+  }
+  if (!prefixIds.length) return null;
+  const stageProps = normalizeProps(raw.stageProps).slice(0, 60);
+  const originalOrder = Array.isArray(raw.originalOrder)
+    ? raw.originalOrder.map(String).filter(id => idSet.has(id))
+    : prefixIds.slice();
+  const chainStart = Array.isArray(raw.chainStartOrder)
+    ? raw.chainStartOrder.map(String).filter(id => idSet.has(id))
+    : originalOrder.slice();
+  return { prefixIds, stageProps, originalOrder, chainStartOrder: chainStart };
+}
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/solve', (req, res) => {
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
   res.json(solve(scenes, constraints, { mode, timeLimit }));
+});
+
+/** 演出中重排：确认已完成连续前缀 + 当前舞台实际道具，只重排剩余场景 */
+app.post('/api/replan', (req, res) => {
+  const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
+  const { errors: rpErrors, replan: replanOpts } = validateReplan(req.body, scenes || []);
+  if (errors.length || rpErrors.length) {
+    return res.status(400).json({ ok: false, errors: [...errors, ...rpErrors] });
+  }
+  res.json(replan(scenes, constraints, { mode, timeLimit, replan: replanOpts }));
 });
 
 app.get('/api/plans', (req, res) => {
@@ -123,7 +202,8 @@ app.post('/api/plans', (req, res) => {
   if (!name) return res.status(400).json({ ok: false, errors: ['方案名称不能为空'] });
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
-  const plan = store.create({ name, mode, timeLimit, scenes, constraints });
+  const replanState = sanitizeReplanState(req.body && req.body.replanState, new Set(scenes.map(s => s.id)));
+  const plan = store.create({ name, mode, timeLimit, scenes, constraints, replanState });
   res.status(201).json({ ok: true, plan });
 });
 
@@ -138,7 +218,8 @@ app.put('/api/plans/:id', (req, res) => {
   if (!name) return res.status(400).json({ ok: false, errors: ['方案名称不能为空'] });
   const { errors, mode, timeLimit, scenes, constraints } = validatePayload(req.body);
   if (errors.length) return res.status(400).json({ ok: false, errors });
-  const plan = store.update(req.params.id, { name, mode, timeLimit, scenes, constraints });
+  const replanState = sanitizeReplanState(req.body && req.body.replanState, new Set(scenes.map(s => s.id)));
+  const plan = store.update(req.params.id, { name, mode, timeLimit, scenes, constraints, replanState });
   if (!plan) return res.status(404).json({ ok: false, errors: ['方案不存在'] });
   res.json({ ok: true, plan });
 });

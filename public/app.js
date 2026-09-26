@@ -11,6 +11,9 @@ const state = {
   timeLimit: 120,
   scenes: [], // classic: { id, name, props }；timed 额外带 { duration, required, value }
   constraints: { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] },
+  live: null, // 最近一次求解/重排结果（当前节目单）
+  replan: null, // 演出中重排会话：{ prefixIds, chainStartOrder, kDraft, stageProps }
+  savedReplan: null, // 随方案保存的重排状态（载入后用于自动恢复）
 };
 
 const isTimed = () => state.mode === 'timed';
@@ -125,12 +128,15 @@ function renderScenes() {
     del.className = 'btn btn-sm btn-danger';
     del.textContent = '删除';
     del.addEventListener('click', () => {
+      if (state.replan && !confirm('删除场景将取消当前演出中重排进度，确定继续？')) return;
       state.scenes.splice(i, 1);
       // 清理引用该场景的约束
       const c = state.constraints;
       c.dependencies = c.dependencies.filter(d => d.before !== s.id && d.after !== s.id);
       c.fixedPositions = c.fixedPositions.filter(f => f.sceneId !== s.id);
       c.forbiddenAdjacencies = c.forbiddenAdjacencies.filter(f => f.a !== s.id && f.b !== s.id);
+      state.live = null;
+      state.replan = null;
       renderAll();
     });
     tdOp.appendChild(del);
@@ -169,6 +175,8 @@ function applyMode(mode) {
     });
   }
   $('#result-card').hidden = true;
+  state.live = null;
+  state.replan = null;
   renderAll();
 }
 
@@ -278,6 +286,13 @@ async function doSolve() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload()),
   });
+  // 重新求解会取消演出中重排会话
+  state.live = data.ok ? data : null;
+  state.replan = null;
+  renderResult(data);
+}
+
+function renderResult(data) {
   const box = $('#result');
   box.innerHTML = '';
   $('#result-card').hidden = false;
@@ -290,8 +305,270 @@ async function doSolve() {
     box.appendChild(conflictBlock(data.conflict, data.reason === 'required-overtime'));
     return;
   }
+  const isReplan = !!data.replanned;
+  if (isReplan) box.appendChild(comparisonBlock(data));
   box.appendChild(data.mode === 'timed' ? timedResultBlock(data) : resultBlock(data));
+  box.appendChild(replanPanelBlock(data));
   $('#result-card').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/* ================= 演出中重排 ================= */
+function plannedPropsOf(id) {
+  const s = sceneById(id);
+  return s ? s.props.slice() : [];
+}
+
+function startReplanSession(data) {
+  const prefix = state.replan && state.replan.prefixIds
+    ? state.replan.prefixIds
+    : (data.prefixIds || []);
+  state.replan = {
+    prefixIds: prefix.slice(),
+    chainStartOrder: (state.replan && state.replan.chainStartOrder)
+      ? state.replan.chainStartOrder.slice()
+      : (data.originalOrder && data.originalOrder.length ? data.originalOrder.slice() : data.order.slice()),
+    kDraft: prefix.length,
+    stageProps: (state.replan && state.replan.stageProps) ? state.replan.stageProps.slice() : [],
+  };
+}
+
+function replanPanelBlock(data) {
+  if (!state.replan) startReplanSession(data);
+  const rp = state.replan;
+  const prefixLen = rp.prefixIds.length;
+  const wrap = document.createElement('div');
+  wrap.className = 'replan-panel';
+
+  const h = document.createElement('h3');
+  h.textContent = '🎬 演出中重排';
+  wrap.appendChild(h);
+
+  const intro = document.createElement('p');
+  intro.className = 'hint';
+  intro.textContent = prefixLen
+    ? `当前已确认完成前 ${prefixLen} 个场景（顺序不可改变），只能在其后续继续确认前缀。`
+    : '从当前节目单确认已完成的连续前缀，并录入此刻舞台上的实际道具（含计划外道具），系统只重排剩余场景。';
+  wrap.appendChild(intro);
+
+  // 前缀确认：点击序号
+  const kRow = document.createElement('div');
+  kRow.className = 'replan-krow';
+  const kLabel = document.createElement('span');
+  kLabel.textContent = '已完成到第';
+  kRow.appendChild(kLabel);
+  const select = document.createElement('select');
+  select.className = 'replan-k';
+  for (let k = prefixLen; k <= data.order.length; k++) {
+    const opt = document.createElement('option');
+    opt.value = String(k);
+    opt.textContent = k === 0 ? '0（尚未开始）' : String(k);
+    if (k === rp.kDraft) opt.selected = true;
+    select.appendChild(opt);
+  }
+  kRow.appendChild(select);
+  const kAfter = document.createElement('span');
+  kAfter.textContent = '位';
+  kRow.appendChild(kAfter);
+  wrap.appendChild(kRow);
+
+  // 前缀预览
+  const preview = document.createElement('div');
+  preview.className = 'replan-prefix-preview';
+  const previewOrder = data.order.slice(0, rp.kDraft);
+  preview.appendChild(flowBlock(previewOrder, previewOrder.length));
+  wrap.appendChild(preview);
+
+  // 舞台实际道具
+  const propsRow = document.createElement('label');
+  propsRow.className = 'replan-props-row';
+  propsRow.innerHTML = '<span>当前舞台实际道具：</span>';
+  const propsInput = document.createElement('input');
+  propsInput.type = 'text';
+  propsInput.className = 'replan-props-input';
+  propsInput.placeholder = '逗号分隔，如：长桌, 椅子, 备用话筒';
+  propsInput.value = rp.stageProps.join(', ');
+  propsRow.appendChild(propsInput);
+  wrap.appendChild(propsRow);
+
+  const fillBtn = document.createElement('button');
+  fillBtn.className = 'btn btn-sm btn-ghost';
+  fillBtn.textContent = '↺ 取第 K 个场景的计划道具';
+  fillBtn.style.marginLeft = '0';
+  fillBtn.addEventListener('click', () => {
+    if (rp.kDraft === 0) {
+      propsInput.value = '';
+      rp.stageProps = [];
+      return;
+    }
+    const id = data.order[rp.kDraft - 1];
+    const ps = plannedPropsOf(id);
+    propsInput.value = ps.join(', ');
+    rp.stageProps = ps.slice();
+  });
+  wrap.appendChild(fillBtn);
+
+  const doBtn = document.createElement('button');
+  doBtn.className = 'btn btn-primary';
+  doBtn.style.marginTop = '10px';
+  doBtn.textContent = '🔀 只重排剩余场景';
+  if (rp.kDraft >= data.order.length) {
+    doBtn.disabled = true;
+    doBtn.title = '全部场景均已完成，无需重排';
+  }
+  wrap.appendChild(doBtn);
+
+  const msg = document.createElement('div');
+  msg.className = 'replan-msg';
+  wrap.appendChild(msg);
+
+  select.addEventListener('change', () => {
+    rp.kDraft = Number(select.value);
+    wrap.replaceWith(replanPanelBlock(data));
+  });
+  propsInput.addEventListener('input', () => {
+    rp.stageProps = propsInput.value.split(/[,，]/).map(x => x.trim()).filter(Boolean);
+  });
+  doBtn.addEventListener('click', () => doReplan(data, doBtn, msg));
+
+  return wrap;
+}
+
+async function doReplan(data, btn, msgEl) {
+  const rp = state.replan;
+  const prefixIds = data.order.slice(0, rp.kDraft);
+  const bodyObj = payload();
+  bodyObj.replan = {
+    prefixIds,
+    stageProps: rp.stageProps,
+    originalOrder: data.order,
+  };
+  btn.disabled = true;
+  msgEl.textContent = '重排中…';
+  msgEl.classList.remove('replan-error');
+  const res = await api('/api/replan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bodyObj),
+  });
+  btn.disabled = false;
+
+  if (res.errors) {
+    msgEl.textContent = res.errors.join('；');
+    msgEl.classList.add('replan-error');
+    return;
+  }
+  if (!res.ok) {
+    msgEl.innerHTML = '';
+    msgEl.classList.add('replan-error');
+    const box = document.createElement('div');
+    box.className = 'conflict-box';
+    box.appendChild(conflictContent(res.conflict, res.conflict && res.conflict.type === 'required-overtime'));
+    msgEl.appendChild(box);
+    return;
+  }
+
+  // 重排成功：更新会话（前缀不可缩短），用链式起点做累计对比
+  state.replan = {
+    prefixIds,
+    chainStartOrder: rp.chainStartOrder.slice(),
+    kDraft: prefixIds.length,
+    stageProps: rp.stageProps.slice(),
+  };
+  state.live = res;
+  renderResult(res);
+}
+
+function comparisonBlock(data) {
+  const wrap = document.createElement('div');
+  wrap.className = 'replan-compare';
+
+  const h = document.createElement('h3');
+  h.textContent = '🔀 重排结果对比';
+  wrap.appendChild(h);
+
+  const cols = document.createElement('div');
+  cols.className = 'replan-cols';
+
+  // 原计划（参照）
+  const colOld = document.createElement('div');
+  colOld.className = 'replan-col replan-col-old';
+  const oldTitle = document.createElement('div');
+  oldTitle.className = 'replan-col-title';
+  oldTitle.textContent = '原计划';
+  colOld.appendChild(oldTitle);
+  colOld.appendChild(flowBlock(data.originalOrder || data.order, 0, true));
+  cols.appendChild(colOld);
+
+  // 新计划（前缀 + 新后缀）
+  const colNew = document.createElement('div');
+  colNew.className = 'replan-col replan-col-new';
+  const newTitle = document.createElement('div');
+  newTitle.className = 'replan-col-title';
+  newTitle.textContent = '前缀（已完成，不可改）＋ 新后缀';
+  colNew.appendChild(newTitle);
+  colNew.appendChild(flowBlock(data.order, data.prefixIds.length));
+  cols.appendChild(colNew);
+
+  wrap.appendChild(cols);
+
+  // 账目
+  const stats = document.createElement('div');
+  stats.className = 'replan-stats';
+  const fmtDelta = (d) => {
+    if (d === null || d === undefined) return '—';
+    if (d < 0) return `<span class="delta-down">减少 ${-d}</span>`;
+    if (d > 0) return `<span class="delta-up">增加 ${d}</span>`;
+    return '<span class="delta-flat">不变（0）</span>';
+  };
+  const lines = [];
+  if (data.originalTailCost !== null && data.originalTailCost !== undefined) {
+    lines.push(`<span>原计划后缀代价：<strong>${data.originalTailCost}</strong></span>`);
+    lines.push(`<span>新后缀代价：<strong>${data.suffixCost}</strong></span>`);
+  }
+  if (data.costDelta !== null && data.costDelta !== undefined) {
+    lines.push(`<span>整场代价变动：${fmtDelta(data.costDelta)}（原 ${data.originalTotalCost} → 新 ${data.totalCost}）</span>`);
+  }
+  if (data.mode === 'timed' && data.valueDelta !== null && data.valueDelta !== undefined) {
+    const vd = data.valueDelta;
+    const vtxt = vd < 0
+      ? `<span class="delta-down">减少 ${-vd}</span>`
+      : vd > 0 ? `<span class="delta-up">增加 ${vd}</span>` : '<span class="delta-flat">不变（0）</span>';
+    lines.push(`<span>入选可选价值变动：${vtxt}（${data.originalTotalValue} → ${data.totalValue}；已完成前缀价值 ${data.prefixValue} 已计入）</span>`);
+    lines.push(`<span>时长：前缀已用 ${data.prefixDuration} + 后缀 ${data.suffixDuration} = ${data.usedDuration} / ${data.timeLimit} 分钟（剩余 ${data.remainingDuration}）</span>`);
+  }
+  stats.innerHTML = lines.join('');
+  wrap.appendChild(stats);
+
+  // 舍弃 / 新增场景
+  const changed = document.createElement('div');
+  changed.className = 'replan-changes';
+  const chipLine = (title, ids, cls) => {
+    const div = document.createElement('div');
+    div.className = 'replan-change-line ' + (cls || '');
+    const lab = document.createElement('span');
+    lab.className = 'replan-change-label';
+    lab.textContent = title;
+    div.appendChild(lab);
+    if (!ids.length) {
+      const none = document.createElement('span');
+      none.className = 'hint';
+      none.textContent = '无';
+      div.appendChild(none);
+    } else {
+      ids.forEach(id => {
+        const c = document.createElement('span');
+        c.className = 'change-chip ' + (cls || '');
+        c.textContent = sceneName(id);
+        div.appendChild(c);
+      });
+    }
+    return div;
+  };
+  changed.appendChild(chipLine('被舍弃：', data.droppedScenes || [], 'change-drop'));
+  changed.appendChild(chipLine('新增入选：', data.addedScenes || [], 'change-add'));
+  wrap.appendChild(changed);
+
+  return wrap;
 }
 
 function errorBlock(errors) {
@@ -313,11 +590,32 @@ function errorBlock(errors) {
 function conflictBlock(conflict, isOvertime) {
   const div = document.createElement('div');
   div.className = 'conflict-box';
+  div.appendChild(conflictContent(conflict, isOvertime));
+  return div;
+}
+
+function conflictContent(conflict, isOvertime) {
+  const frag = document.createDocumentFragment();
   const h = document.createElement('h3');
-  h.textContent = isOvertime ? '⚠ 无解：必演场景已超时' : '⚠ 无解：约束相互冲突';
+  if (conflict.type === 'prefix-conflict') {
+    h.textContent = '⚠ 已完成前缀与约束冲突';
+  } else {
+    h.textContent = isOvertime ? '⚠ 无解：必演场景已超时' : '⚠ 无解：约束相互冲突';
+  }
   const p = document.createElement('p');
   p.textContent = conflict.message;
-  div.append(h, p);
+  frag.append(h, p);
+
+  // 前缀冲突：逐条具体冲突（跨前缀依赖、固定序位、禁止相邻、超时等）
+  if (Array.isArray(conflict.conflicts) && conflict.conflicts.length) {
+    const ul = document.createElement('ul');
+    for (const cf of conflict.conflicts) {
+      const li = document.createElement('li');
+      li.textContent = cf.message;
+      ul.appendChild(li);
+    }
+    frag.appendChild(ul);
+  }
   if (conflict.constraints && conflict.constraints.length) {
     const ul = document.createElement('ul');
     for (const c of conflict.constraints) {
@@ -325,14 +623,14 @@ function conflictBlock(conflict, isOvertime) {
       li.textContent = c.text;
       ul.appendChild(li);
     }
-    div.appendChild(ul);
+    frag.appendChild(ul);
   }
-  return div;
+  return frag;
 }
 
-function flowBlock(order) {
+function flowBlock(order, prefixLen, isReference) {
   const flow = document.createElement('div');
-  flow.className = 'order-flow';
+  flow.className = 'order-flow' + (isReference ? ' order-flow-ref' : '');
   if (!order.length) {
     const empty = document.createElement('span');
     empty.className = 'hint';
@@ -349,8 +647,14 @@ function flowBlock(order) {
     }
     const s = sceneById(id);
     const chip = document.createElement('span');
-    chip.className = 'order-chip' + (s && s.required ? ' order-chip-req' : '');
-    chip.textContent = `${i + 1}. ${sceneName(id)}${s && s.required ? ' ★必演' : ''}`;
+    let cls = 'order-chip';
+    if (s && s.required) cls += ' order-chip-req';
+    if (prefixLen && i < prefixLen) cls += ' order-chip-done';
+    chip.className = cls;
+    let label = `${i + 1}. ${sceneName(id)}`;
+    if (s && s.required) label += ' ★必演';
+    if (prefixLen && i === prefixLen - 1) label += ' ✅';
+    chip.textContent = label;
     flow.appendChild(chip);
   });
   return flow;
@@ -371,12 +675,20 @@ function stepsBlock(data) {
   ul.className = 'step-list';
   data.steps.forEach((step, i) => {
     const li = document.createElement('li');
+    if (step.phase) li.classList.add('step-' + step.phase);
     const title = document.createElement('div');
     title.className = 'step-title';
+    const tag = step.phase === 'done'
+      ? '<span class="phase-tag phase-done">已完成</span> '
+      : step.phase === 'suffix'
+        ? '<span class="phase-tag phase-suffix">待执行</span> '
+        : '';
     if (step.type === 'setup') {
-      title.textContent = `开场布置 →「${sceneName(step.scene)}」`;
+      title.innerHTML = `${tag}开场布置 →「${escapeHtml(sceneName(step.scene))}」`;
+    } else if (step.fromStage) {
+      title.innerHTML = `${tag}从当前舞台实际道具 →「${escapeHtml(sceneName(step.to))}」`;
     } else {
-      title.textContent = `换景 ${i}：「${sceneName(step.from)}」→「${sceneName(step.to)}」`;
+      title.innerHTML = `${tag}换景 ${i}：「${escapeHtml(sceneName(step.from))}」→「${escapeHtml(sceneName(step.to))}」`;
     }
     li.appendChild(title);
 
@@ -399,7 +711,8 @@ function stepsBlock(data) {
 
 function resultBlock(data) {
   const frag = document.createDocumentFragment();
-  frag.appendChild(flowBlock(data.order));
+  const prefixLen = data.replanned ? (data.prefixIds || []).length : 0;
+  frag.appendChild(flowBlock(data.order, prefixLen));
   frag.appendChild(stepsBlock(data));
   return frag;
 }
@@ -440,14 +753,20 @@ function timedResultBlock(data) {
 
   const summary = document.createElement('div');
   summary.className = 'timed-summary';
-  summary.innerHTML =
+  let html =
     `<span>入选可选场景价值：<strong>${data.totalValue}</strong></span>` +
     `<span>已用时长：<strong>${data.usedDuration}</strong> / ${data.timeLimit} 分钟</span>` +
     `<span>剩余时长：<strong>${data.remainingDuration}</strong> 分钟</span>` +
     `<span>道具增减：<strong>${data.totalCost}</strong> 次</span>`;
+  if (data.replanned) {
+    html = `<span>前缀已用：<strong>${data.prefixDuration}</strong> 分钟（价值 ${data.prefixValue}）</span>`
+      + `<span>后缀可用：<strong>${data.timeBudget}</strong> 分钟</span>` + html;
+  }
+  summary.innerHTML = html;
   frag.appendChild(summary);
 
-  frag.appendChild(flowBlock(data.order));
+  const prefixLen = data.replanned ? (data.prefixIds || []).length : 0;
+  frag.appendChild(flowBlock(data.order, prefixLen));
   frag.appendChild(sceneListBlock(`入选场景（${data.selectedIds.length} 个）`, data.selectedIds, 'pick-in'));
   frag.appendChild(sceneListBlock(`舍弃场景（${data.excludedIds.length} 个，不参与约束）`, data.excludedIds, 'pick-out'));
   frag.appendChild(stepsBlock(data));
@@ -477,14 +796,24 @@ async function refreshPlans() {
 async function savePlan() {
   const name = $('#plan-name').value.trim();
   if (!name) { showStatus('请先填写方案名称', true); return; }
-  const body = JSON.stringify({ name, ...payload() });
+  const p = payload();
+  // 保存当前演出中重排进度（已确认前缀、实际道具、链式起点），载入后可继续重排
+  if (state.replan && state.replan.prefixIds.length) {
+    p.replanState = {
+      prefixIds: state.replan.prefixIds,
+      stageProps: state.replan.stageProps,
+      originalOrder: state.live ? state.live.order : state.replan.prefixIds,
+      chainStartOrder: state.replan.chainStartOrder,
+    };
+  }
+  const body = JSON.stringify({ name, ...p });
   const headers = { 'Content-Type': 'application/json' };
   const data = state.planId
     ? await api(`/api/plans/${state.planId}`, { method: 'PUT', headers, body })
     : await api('/api/plans', { method: 'POST', headers, body });
   if (data.errors) { showStatus(data.errors.join('；'), true); return; }
   state.planId = data.plan.id;
-  showStatus(`方案「${name}」已保存`);
+  showStatus(`方案「${name}」已保存（含当前重排进度，载入后可继续重排）`);
   await refreshPlans();
 }
 
@@ -496,7 +825,84 @@ async function loadPlan() {
   hydrateFromPlan(data.plan);
   $('#plan-name').value = data.plan.name;
   $('#result-card').hidden = true;
-  showStatus(`已载入方案「${data.plan.name}」，可继续编辑`);
+  state.live = null;
+  state.replan = null;
+  if (data.plan.replanState && Array.isArray(data.plan.replanState.prefixIds)
+      && data.plan.replanState.prefixIds.length) {
+    state.savedReplan = {
+      prefixIds: data.plan.replanState.prefixIds.slice(),
+      stageProps: (data.plan.replanState.stageProps || []).slice(),
+      originalOrder: Array.isArray(data.plan.replanState.originalOrder)
+        ? data.plan.replanState.originalOrder.slice()
+        : data.plan.replanState.prefixIds.slice(),
+      chainStartOrder: Array.isArray(data.plan.replanState.chainStartOrder)
+        ? data.plan.replanState.chainStartOrder.slice()
+        : (Array.isArray(data.plan.replanState.originalOrder) ? data.plan.replanState.originalOrder.slice() : data.plan.replanState.prefixIds.slice()),
+    };
+    showStatus(`已载入方案「${data.plan.name}」，正在恢复演出中重排进度…`);
+    await restoreSavedReplan();
+  } else {
+    state.savedReplan = null;
+    showStatus(`已载入方案「${data.plan.name}」，可继续编辑`);
+  }
+}
+
+/** 载入带重排状态的方案：先求一次解，再按保存的前缀/实际道具自动重排。 */
+async function restoreSavedReplan() {
+  const saved = state.savedReplan;
+  if (!saved) return;
+  const solveData = await api('/api/solve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload()),
+  });
+  if (!solveData.ok) {
+    state.savedReplan = null;
+    renderResult(solveData);
+    return;
+  }
+  state.live = solveData;
+  state.replan = null;
+
+  // 校验保存的前缀仍是当前节目单的连续前缀；不一致则放弃自动恢复
+  const prefixIds = saved.prefixIds;
+  const isPrefix = prefixIds.every((id, i) => solveData.order[i] === id);
+  if (!isPrefix) {
+    state.savedReplan = null;
+    state.replan = null;
+    renderResult(solveData);
+    showStatus('方案已载入，但保存的重排前缀与当前节目单不一致，请重新确认前缀');
+    return;
+  }
+
+  const bodyObj = payload();
+  bodyObj.replan = {
+    prefixIds,
+    stageProps: saved.stageProps,
+    originalOrder: saved.originalOrder,
+  };
+  const res = await api('/api/replan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bodyObj),
+  });
+  state.savedReplan = null;
+  if (!res.ok) {
+    // 重放冲突：展示原解，让用户手工处理
+    state.replan = null;
+    renderResult(solveData);
+    showStatus('方案已载入，但保存的重排状态当前不可行，请重新确认前缀与舞台道具');
+    return;
+  }
+  state.replan = {
+    prefixIds: prefixIds.slice(),
+    chainStartOrder: saved.chainStartOrder.slice(),
+    kDraft: prefixIds.length,
+    stageProps: saved.stageProps.slice(),
+  };
+  state.live = res;
+  renderResult(res);
+  showStatus(`已恢复重排进度：前 ${prefixIds.length} 个场景已完成，可继续重排`);
 }
 
 function hydrateFromPlan(p) {
@@ -534,6 +940,9 @@ function newPlan() {
   state.planId = null;
   state.scenes = [];
   state.constraints = { dependencies: [], fixedPositions: [], forbiddenAdjacencies: [] };
+  state.live = null;
+  state.replan = null;
+  state.savedReplan = null;
   $('#plan-name').value = '';
   $('#plan-select').value = '';
   applyMode('classic');
